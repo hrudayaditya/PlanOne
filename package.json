@@ -1,0 +1,44 @@
+{
+  "name": "planone",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsup src/index.ts src/cli.ts --format esm --dts",
+    "planone": "node dist/cli.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "ab-report": "tsx src/cli.ts ab-report"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "*",
+    "@google/generative-ai": "*",
+    "@modelcontextprotocol/sdk": "*",
+    "better-sqlite3": "*",
+    "chokidar": "*",
+    "cors": "*",
+    "express": "*",
+    "minimatch": "^10.2.5",
+    "openai": "*",
+    "p-queue": "*",
+    "p-retry": "*",
+    "simple-git": "*",
+    "tiktoken": "*",
+    "xstate": "*",
+    "yaml": "^2.8.4",
+    "zod": "*"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "*",
+    "@types/cors": "*",
+    "@types/express": "*",
+    "@types/node": "*",
+    "tsup": "*",
+    "tsx": "*",
+    "typescript": "*",
+    "vitest": "*"
+  }
+}

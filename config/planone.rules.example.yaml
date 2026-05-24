@@ -1,0 +1,51 @@
+# PlanOne repository rules file.
+# Copy this to PLANONE.rules.yaml at the repository root and edit to match
+# your repo's operational constraints.
+
+# Schema version for the rules file.
+version: "1.0"
+
+# Human-readable repository identifier.
+repo_name: "acme-platform"
+
+# Glob patterns PlanOne must never modify.
+never_touch:
+  - "**/migrations/**"
+  - "**/.env*"
+  - "**/secrets/**"
+  - "**/dist/**"
+
+# Natural-language conditions that must force escalation.
+always_escalate_if:
+  - "changes authentication logic"
+  - "modifies database schema"
+  - "touches billing or payment processing"
+  - "changes production infrastructure configuration"
+
+# Preferred implementation conventions for the executor.
+preferred_patterns:
+  testing: "Add Vitest unit coverage near the changed module and prefer deterministic test fixtures."
+  error_handling: "Use typed domain errors and return Result-like objects instead of throwing for expected failures."
+  naming: "Prefer explicit verb-first function names and PascalCase for exported types."
+  imports: "Use ESM imports with sorted groups: external packages, internal modules, then relative files."
+
+# Anti-patterns the executor must avoid.
+forbidden_patterns:
+  - "console.log in production code"
+  - "any type assertions"
+  - "disabling TypeScript strictness checks"
+  - "editing generated files by hand"
+
+# Future notification targets. Phase 1 logs these only.
+escalation_contacts:
+  - "eng-oncall@example.com"
+  - "#platform-alerts"
+
+# Hard safety limit for SEK: diffs larger than this escalate.
+max_files_changed: 20
+
+# Preferred test command if auto-detection would be ambiguous.
+test_command: "pnpm test --filter @acme/platform-core"
+
+# Mutation testing scope for later verifier phases.
+mutation_scope: "changed_only"

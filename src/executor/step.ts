@@ -127,7 +127,7 @@ export interface StepExecutionResult {
   typeCheckPassed: boolean
 }
 
-const MAX_TOOL_ITERATIONS = 100
+const MAX_TOOL_ITERATIONS = 10
 const MAX_DISCOVERY_TOOL_CALLS = 5
 const ITERATION_WARNING_THRESHOLD = 10
 const MAX_IMPLEMENTATION_ADDITIONAL_READS = 2
@@ -137,6 +137,7 @@ const MAX_DISCOVERY_LINES_PER_FILE = 20
 const MAX_PRELOADED_FILE_LINES = 400
 const DEFAULT_CONTEXT_CAP_RATIO = 0.6
 const CONTINUOUS_CONTEXT_CAP_RATIO = 0.75
+const USE_MONITOR = false
 const POST_WRITE_ALLOWED_TOOLS = new Set(['run_tests', 'run_command', 'git_diff', 'git_status'])
 const MAX_FILES_WRITTEN_PER_STEP = 3
 type CompressionProviderWithDefaultModel = CompressionLlmProvider & {
@@ -265,20 +266,31 @@ export async function executeStep(
         continue
       }
     }
-    const preMonitor = await runPreActionMonitor({
-      currentStep: input.step,
-      cyclePlan,
-      enrichedPacket: input.enrichedPacket,
-      confirmedFiles,
-      preloadedFileContents,
-      rules: input.intake.rules,
-      stepHistory,
-      taskId: input.plan.taskId,
-      abMode: input.abMode,
-      rts: input.rts,
-      client: input.client,
-      repoRoot: input.repoRoot
-    })
+    const preMonitor = USE_MONITOR
+      ? await runPreActionMonitor({
+        currentStep: input.step,
+        cyclePlan,
+        enrichedPacket: input.enrichedPacket,
+        confirmedFiles,
+        preloadedFileContents,
+        rules: input.intake.rules,
+        stepHistory,
+        taskId: input.plan.taskId,
+        abMode: input.abMode,
+        rts: input.rts,
+        client: input.client,
+        repoRoot: input.repoRoot
+      })
+      : {
+        vetoResult: {
+          vetoed: false,
+          reason: null,
+          vetoType: null,
+          constraintReminder: null
+        },
+        constraintReminders: [],
+        remindersAsText: ''
+      }
     logInfo('executor:step', '[Step1] Monitor veto result', {
       stepIndex: input.step.stepIndex,
       vetoed: preMonitor.vetoResult.vetoed,
@@ -566,6 +578,7 @@ export async function executeStep(
     const historySummaries: string[] = []
     let finalText = ''
     let toolIterations = 0
+    let earlyExitReason: string | null = null
     let postWriteMode = false
     let validationPassed = false
     let validationFailed = false
@@ -588,10 +601,22 @@ export async function executeStep(
     let discoveryToolCalls = 0
     let implementationAdditionalReads = 0
     let consecutiveSearchMisses = 0
+    let verifiedFileReadCount = 0
+    let hasReadVerifiedFile = false
+    let hasReadHelperInSameFile = false
     let surfaceConfirmedFiles: string[] = []
     let repeatedRepairFailure: { toolName: string; count: number } | null = null
     const filesReadInDiscovery = new Set<string>()
     const consecutiveSameToolErrors = new Map<string, number>()
+    const primaryVerifiedChunk = input.enrichedPacket.verifiedChunkIds[0] ?? ''
+    const primaryVerifiedChunkSeparator = primaryVerifiedChunk.lastIndexOf(':')
+    const primaryVerifiedFilePath = primaryVerifiedChunkSeparator >= 0
+      ? primaryVerifiedChunk.slice(0, primaryVerifiedChunkSeparator)
+      : ''
+    const primaryVerifiedRange = primaryVerifiedChunkSeparator >= 0
+      ? primaryVerifiedChunk.slice(primaryVerifiedChunkSeparator + 1)
+      : ''
+    const primaryVerifiedStartLine = Number.parseInt((primaryVerifiedRange.split('-')[0] ?? ''), 10)
 
     while (toolIterations < MAX_TOOL_ITERATIONS) {
       progressState.iterationCount = toolIterations + 1
@@ -1013,6 +1038,61 @@ export async function executeStep(
           continue
         }
 
+        const hasVerifiedWindow = input.enrichedPacket.verifiedChunkIds.length > 0
+        if (
+          hasReadVerifiedFile
+          && hasReadHelperInSameFile
+          && writeSuccessCount === 0
+          && toolName !== 'replace_in_file'
+          && toolName !== 'apply_patch'
+        ) {
+          const forceWriteMsg = '[PlanOne] You have read the verified function and at least one related helper. No more reading is allowed. Call replace_in_file or apply_patch now with your change.'
+          eventMessages.push({
+            role: 'user',
+            content: [{
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: forceWriteMsg
+            }],
+            cache_control: { type: 'ephemeral' }
+          })
+          activeWorkingContent = appendToolResult(
+            activeWorkingContent,
+            toolUseId,
+            forceWriteMsg,
+            input.plan.assignedExecutorModel,
+            budgetAnchors
+          )
+          historySummaries.push('forced write after reading verified function and helper')
+          continue
+        }
+
+        if (toolName === 'search_in_files' && writeSuccessCount === 0 && hasVerifiedWindow) {
+          const blockedResultText = [
+            '[BLOCKED] The relevant code is already shown in the initial message.',
+            'Read the preloaded section and make your change directly.',
+            'Do not search for code that is already visible.'
+          ].join(' ')
+          eventMessages.push({
+            role: 'user',
+            content: [{
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: blockedResultText
+            }],
+            cache_control: { type: 'ephemeral' }
+          })
+          activeWorkingContent = appendToolResult(
+            activeWorkingContent,
+            toolUseId,
+            blockedResultText,
+            input.plan.assignedExecutorModel,
+            budgetAnchors
+          )
+          historySummaries.push(`${toolName} blocked (verified code window already provided)`)
+          continue
+        }
+
         if (isImplementationSearchTool(toolName) && getStepPhase(input.step) === 'implementation' && consecutiveSearchMisses >= 2 && writeSuccessCount === 0) {
           const blockedResultText = [
             '[BLOCKED: Third consecutive empty search. Searching is no longer permitted.',
@@ -1282,6 +1362,28 @@ export async function executeStep(
           if (getStepPhase(input.step) === 'implementation' && !preloadedFilePaths.has(normalizedPath)) {
             implementationAdditionalReads += 1
           }
+
+          if (
+            primaryVerifiedFilePath.length > 0
+            && (
+              normalizedPath === primaryVerifiedFilePath
+              || normalizedPath.endsWith(`/${primaryVerifiedFilePath}`)
+              || primaryVerifiedFilePath.endsWith(`/${normalizedPath}`)
+            )
+          ) {
+            const requestedStartLine = typeof toolInput.startLine === 'number' ? toolInput.startLine : 1
+            const requestedEndLine = typeof toolInput.endLine === 'number' ? toolInput.endLine : requestedStartLine
+            const coversVerifiedLine = Number.isFinite(primaryVerifiedStartLine)
+              && primaryVerifiedStartLine > 0
+              && requestedStartLine <= primaryVerifiedStartLine
+              && requestedEndLine >= primaryVerifiedStartLine
+
+            if (coversVerifiedLine) {
+              hasReadVerifiedFile = true
+            } else if (hasReadVerifiedFile) {
+              hasReadHelperInSameFile = true
+            }
+          }
         }
 
         if (toolName === 'write_file' && typeof toolInput.path === 'string') {
@@ -1488,7 +1590,7 @@ export async function executeStep(
           }
         }
 
-        const toolResultText = decorateToolResult(
+        let toolResultText = decorateToolResult(
           toolResult.success
             ? toolResult.output
             : `ERROR: ${toolResult.error ?? 'Tool failed'}`,
@@ -1500,6 +1602,24 @@ export async function executeStep(
           implementationSurface,
           consecutiveSearchMisses
         )
+
+        if (toolName === 'read_file' && toolResult.success && typeof toolInput.path === 'string') {
+          const readPath = toRepoRelativePath(input.repoRoot, toolInput.path)
+          const verifiedFilePath = input.enrichedPacket.verifiedChunkIds[0]?.split(':')[0] ?? ''
+
+          if (verifiedFilePath.length > 0 && (
+            readPath === verifiedFilePath
+            || readPath.endsWith(`/${verifiedFilePath}`)
+            || verifiedFilePath.endsWith(`/${readPath}`)
+          )) {
+            verifiedFileReadCount += 1
+
+            if (verifiedFileReadCount >= 2 && writeSuccessCount === 0) {
+              toolResultText += '\n\n[PlanOne] You have read the target function and its helpers. You have enough context to make the fix. Call replace_in_file with the exact change now. Do not read more files.'
+            }
+          }
+        }
+
         eventMessages.push({
           role: 'user',
           content: [{
@@ -1578,8 +1698,32 @@ export async function executeStep(
         break
       }
 
+      if (toolIterations + 1 >= 10 && writeSuccessCount === 0) {
+        earlyExitReason = 'No writes after 10 tool calls. Localization likely incorrect.'
+        logWarn('executor:step', '[Executor:Step] Fail-fast no-write exit', {
+          stepIndex: input.step.stepIndex,
+          toolIterations: toolIterations + 1
+        })
+        break
+      }
+
       activeWorkingContent = trimWorkingContent(activeWorkingContent, budgetAnchors, input.plan.assignedExecutorModel, 'drop_last')
       toolIterations += 1
+    }
+
+    if (earlyExitReason !== null && finalText.trim().length === 0) {
+      actor.send({ type: 'ERROR_OCCURRED', error: new Error(earlyExitReason) })
+      return {
+        outcome: 'error',
+        stepOutput: null,
+        monitorInterventions,
+        vetoReason: earlyExitReason,
+        tokensUsed,
+        costUsd,
+        writeCount: writeSuccessCount,
+        testsPassed,
+        typeCheckPassed
+      }
     }
 
     if (toolIterations >= MAX_TOOL_ITERATIONS && finalText.trim().length === 0) {
@@ -1626,20 +1770,25 @@ export async function executeStep(
     actor.send({ type: 'EXECUTION_COMPLETE', output: stepOutput })
     actor.send({ type: 'OUTPUT_WRITTEN' })
 
-    const postMonitor = await runPostStepMonitor({
-      currentStep: input.step,
-      cyclePlan,
-      enrichedPacket: input.enrichedPacket,
-      confirmedFiles,
-      preloadedFileContents,
-      rules: input.intake.rules,
-      stepHistory,
-      taskId: input.plan.taskId,
-      abMode: input.abMode,
-      rts: input.rts,
-      client: input.client,
-      repoRoot: input.repoRoot
-    }, stepOutput)
+    const postMonitor = USE_MONITOR
+      ? await runPostStepMonitor({
+        currentStep: input.step,
+        cyclePlan,
+        enrichedPacket: input.enrichedPacket,
+        confirmedFiles,
+        preloadedFileContents,
+        rules: input.intake.rules,
+        stepHistory,
+        taskId: input.plan.taskId,
+        abMode: input.abMode,
+        rts: input.rts,
+        client: input.client,
+        repoRoot: input.repoRoot
+      }, stepOutput)
+      : {
+        approved: true,
+        concerns: []
+      }
 
     if (postMonitor.approved === false) {
       monitorInterventions += 1
@@ -1832,6 +1981,7 @@ function buildConversationMessages(
       confirmedFiles,
       input.step.approach
     )
+    const verifiedCodeWindow = buildVerifiedCodeWindow(input.repoRoot, input.enrichedPacket)
     const relatedTests = implementationSurface.relatedTestFiles
       .filter((file) => confirmedFiles.includes(file.sourceFile))
       .map((file) => `${file.path} (${file.confidence} confidence; source ${file.sourceFile})`)
@@ -1863,8 +2013,20 @@ function buildConversationMessages(
       lines.push('')
       lines.push('## Related test files')
       for (const relatedTest of relatedTests) {
-        lines.push(`- ${relatedTest}`)
+      lines.push(`- ${relatedTest}`)
       }
+    }
+
+    if (verifiedCodeWindow !== null) {
+      lines.push('')
+      lines.push(`## Relevant code (${verifiedCodeWindow.filePath} lines ${verifiedCodeWindow.startLine}-${verifiedCodeWindow.endLine})`)
+      lines.push('[Line numbers are display-only. Do not include the N | prefix in old_string.]')
+      lines.push('```text')
+      lines.push(verifiedCodeWindow.content)
+      lines.push('```')
+      lines.push('')
+      lines.push('The fix is in the code shown above. Read it, find the bug, write the fix.')
+      lines.push('Do NOT call search_in_files or read_file for code already shown here unless validation fails and you need repair context.')
     }
 
     if (snippets.length > 0) {
@@ -2406,12 +2568,12 @@ function replaceToolResultContent(message: LlmMessage, nextContent: string): Llm
 export function compactIfNeeded(
   eventMessages: LlmMessage[],
   model: string,
-  preserveLastN: number = 8
+  preserveLastN: number = 6
 ): LlmMessage[] {
   const modelLimit = getModelLimit(model)
   const totalTokens = countMessageTokens(eventMessages, model)
 
-  if (totalTokens < modelLimit * 0.8 || eventMessages.length <= 2 + preserveLastN) {
+  if (totalTokens < modelLimit * 0.6 || eventMessages.length <= 2 + preserveLastN) {
     return eventMessages
   }
 
@@ -3027,6 +3189,69 @@ function getPrimaryImplementationTarget(
   return {
     filePath: preloadedImplementationFiles[0]?.path ?? implementationSurface.primaryFiles[0]?.path ?? '',
     symbolName: null
+  }
+}
+
+function buildVerifiedCodeWindow(
+  repoRoot: string,
+  enrichedPacket: EnrichedPacket
+): { filePath: string; startLine: number; endLine: number; content: string } | null {
+  const primaryChunk = enrichedPacket.verifiedChunkIds[0]
+  if (primaryChunk === undefined) {
+    return null
+  }
+
+  const parsed = parseVerifiedChunkId(primaryChunk)
+  if (parsed === null || parsed.startLine <= 0) {
+    return null
+  }
+
+  const absolutePath = resolve(repoRoot, parsed.filePath)
+  let content: string
+  try {
+    content = readFileSync(absolutePath, 'utf8')
+  } catch {
+    return null
+  }
+
+  const lines = content.split('\n')
+  const windowStart = Math.max(1, parsed.startLine - 3)
+  const windowEnd = Math.min(lines.length, Math.max(parsed.endLine, parsed.startLine + 80))
+  const selectedLines = lines.slice(windowStart - 1, windowEnd)
+  if (selectedLines.length === 0) {
+    return null
+  }
+
+  return {
+    filePath: parsed.filePath,
+    startLine: windowStart,
+    endLine: windowEnd,
+    content: selectedLines
+      .map((line, index) => `${String(windowStart + index).padStart(4, ' ')} | ${line}`)
+      .join('\n')
+  }
+}
+
+function parseVerifiedChunkId(chunkId: string): { filePath: string; startLine: number; endLine: number } | null {
+  const separatorIndex = chunkId.lastIndexOf(':')
+  if (separatorIndex <= 0) {
+    return null
+  }
+
+  const filePath = chunkId.slice(0, separatorIndex)
+  const range = chunkId.slice(separatorIndex + 1)
+  const [startRaw, endRaw] = range.split('-')
+  const startLine = Number.parseInt(startRaw ?? '', 10)
+  const endLine = Number.parseInt(endRaw ?? startRaw ?? '', 10)
+
+  if (!Number.isFinite(startLine) || startLine <= 0 || !Number.isFinite(endLine) || endLine <= 0) {
+    return null
+  }
+
+  return {
+    filePath,
+    startLine,
+    endLine
   }
 }
 

@@ -83,7 +83,7 @@ export class GeminiProvider implements IntakeLlmProvider, PanelMemberLlmProvider
     throw lastError ?? new Error('No Gemini models were available in preferredModels.')
   }
 
-  async generateText(prompt: string, preferredModels: string[]): Promise<{ model: string; text: string }> {
+  generateText = async (prompt: string, preferredModels: string[]): Promise<{ model: string; text: string }> => {
     let lastError: Error | null = null
 
     for (const model of preferredModels) {

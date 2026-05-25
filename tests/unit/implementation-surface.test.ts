@@ -259,6 +259,249 @@ describe('implementation surface', () => {
     }
   })
 
+  it('strongly boosts files backed by verified chunk locations over noisy symbol matches', async () => {
+    const { root, cleanup } = makeRepo()
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), 'def igetattr():\n    return True\n')
+    writeFileSync(join(root, 'astroid/bases.py'), 'def igetattr():\n    return False\n')
+
+    const packet: EnrichedPacket = {
+      ...makePacket(root),
+      originalTask: 'Fix igetattr in astroid/scoped_nodes.py',
+      structuredDescription: 'Fix igetattr in astroid/scoped_nodes.py',
+      affectedArea: 'astroid',
+      affectedSymbols: ['igetattr'],
+      verifiedChunkIds: [`${join(root, 'astroid/scoped_nodes.py')}:2543-2543`],
+      rankedApproaches: [{
+        approach: 'Fix igetattr in scoped_nodes.py',
+        confidence: 0.9,
+        rank: 1,
+        supportingChunkIds: [],
+        estimatedRisk: 'medium'
+      }]
+    }
+
+    const plan: ExecutionPlan = {
+      ...makePlan(),
+      approach: 'Fix igetattr in scoped_nodes.py',
+      steps: [{
+        ...makePlan().steps[0]!,
+        affectedSymbols: ['igetattr'],
+        affectedFiles: []
+      }]
+    }
+
+    const client = {
+      callTool: async (name: string, args: { symbol?: string }) => {
+        if (name === 'symbol_info' && args.symbol === 'igetattr') {
+          return {
+            structuredContent: {
+              symbols: [{
+                name: 'igetattr',
+                symbol_id: 'sym-a',
+                relative_path: 'astroid/bases.py',
+                start_line: 1,
+                end_line: 1
+              }],
+              total: 1,
+              ambiguous: false
+            }
+          }
+        }
+
+        return {
+          structuredContent: {
+            symbols: [],
+            total: 0,
+            ambiguous: false
+          }
+        }
+      }
+    } as unknown as BaseMemoryClient
+
+    try {
+      const surface = await buildImplementationSurface(packet, plan, root, client)
+      expect(surface.primaryFiles[0]?.path).toBe('astroid/scoped_nodes.py')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('filters confirmed symbol matches to the verified line neighborhood', async () => {
+    const { root, cleanup } = makeRepo()
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), 'def igetattr():\n    return True\n')
+    writeFileSync(join(root, 'astroid/bases.py'), 'def igetattr():\n    return False\n')
+
+    const packet: EnrichedPacket = {
+      ...makePacket(root),
+      originalTask: 'Fix igetattr in astroid/scoped_nodes.py',
+      structuredDescription: 'Fix igetattr in astroid/scoped_nodes.py',
+      affectedArea: 'astroid',
+      affectedSymbols: ['igetattr'],
+      verifiedChunkIds: [`${join(root, 'astroid/scoped_nodes.py')}:2543-2543`],
+      rankedApproaches: [{
+        approach: 'Fix igetattr in scoped_nodes.py',
+        confidence: 0.9,
+        rank: 1,
+        supportingChunkIds: [],
+        estimatedRisk: 'medium'
+      }]
+    }
+
+    const plan: ExecutionPlan = {
+      ...makePlan(),
+      approach: 'Fix igetattr in scoped_nodes.py',
+      steps: [{
+        ...makePlan().steps[0]!,
+        affectedSymbols: ['igetattr'],
+        affectedFiles: []
+      }]
+    }
+
+    const client = {
+      callTool: async (name: string, args: { symbol?: string }) => {
+        if (name === 'symbol_info' && args.symbol === 'igetattr') {
+          return {
+            structuredContent: {
+              symbols: [
+                {
+                  name: 'igetattr',
+                  symbol_id: 'sym-a',
+                  relative_path: 'astroid/bases.py',
+                  start_line: 203,
+                  end_line: 234
+                },
+                {
+                  name: 'igetattr',
+                  symbol_id: 'sym-b',
+                  relative_path: 'astroid/scoped_nodes.py',
+                  start_line: 2543,
+                  end_line: 2610
+                }
+              ],
+              total: 2,
+              ambiguous: false
+            }
+          }
+        }
+
+        return {
+          structuredContent: {
+            symbols: [],
+            total: 0,
+            ambiguous: false
+          }
+        }
+      }
+    } as unknown as BaseMemoryClient
+
+    try {
+      const surface = await buildImplementationSurface(packet, plan, root, client)
+      expect(surface.symbols).toEqual([expect.objectContaining({
+        name: 'igetattr',
+        filePath: 'astroid/scoped_nodes.py',
+        startLine: 2543
+      })])
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('seeds confirmed symbols directly from verified localization chunks when lookup misses them', async () => {
+    const { root, cleanup } = makeRepo()
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), 'def igetattr():\n    return True\n')
+
+    const packet: EnrichedPacket = {
+      ...makePacket(root),
+      originalTask: 'Fix igetattr in astroid/scoped_nodes.py',
+      structuredDescription: 'Fix igetattr in astroid/scoped_nodes.py',
+      affectedArea: 'astroid',
+      affectedSymbols: ['igetattr'],
+      verifiedChunkIds: [`${join(root, 'astroid/scoped_nodes.py')}:2543-2543`],
+      rankedApproaches: [{
+        approach: 'Fix igetattr in scoped_nodes.py',
+        confidence: 0.9,
+        rank: 1,
+        supportingChunkIds: [],
+        estimatedRisk: 'medium'
+      }]
+    }
+
+    const plan: ExecutionPlan = {
+      ...makePlan(),
+      approach: 'Fix igetattr in scoped_nodes.py',
+      steps: [{
+        ...makePlan().steps[0]!,
+        affectedSymbols: ['igetattr'],
+        affectedFiles: []
+      }]
+    }
+
+    const client = {
+      callTool: async () => ({
+        structuredContent: {
+          symbols: [],
+          total: 0,
+          ambiguous: false
+        }
+      })
+    } as unknown as BaseMemoryClient
+
+    try {
+      const surface = await buildImplementationSurface(packet, plan, root, client)
+      expect(surface.symbols).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          name: 'igetattr',
+          filePath: 'astroid/scoped_nodes.py',
+          startLine: 2543,
+          endLine: 2543
+        })
+      ]))
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('preloads a window around the verified line instead of the top of the file', async () => {
+    const { root, cleanup } = makeRepo()
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    const lines = Array.from({ length: 2700 }, (_, index) => `line_${index + 1}`)
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), lines.join('\n'))
+
+    const packet: EnrichedPacket = {
+      ...makePacket(root),
+      originalTask: 'Fix igetattr in astroid/scoped_nodes.py',
+      structuredDescription: 'Fix igetattr in astroid/scoped_nodes.py',
+      affectedArea: 'astroid',
+      affectedSymbols: [],
+      verifiedChunkIds: [`${join(root, 'astroid/scoped_nodes.py')}:2543-2543`],
+      rankedApproaches: [{
+        approach: 'Fix igetattr in scoped_nodes.py',
+        confidence: 0.9,
+        rank: 1,
+        supportingChunkIds: [],
+        estimatedRisk: 'medium'
+      }]
+    }
+
+    const plan: ExecutionPlan = {
+      ...makePlan(),
+      approach: 'Fix igetattr in scoped_nodes.py'
+    }
+
+    try {
+      const surface = await buildImplementationSurface(packet, plan, root, makeClient(root))
+      const preloaded = surface.fileContents.get('astroid/scoped_nodes.py')
+      expect(preloaded).toContain('2538 | line_2538')
+      expect(preloaded).toContain('2543 | line_2543')
+      expect(preloaded?.startsWith('   1 |')).toBe(false)
+    } finally {
+      cleanup()
+    }
+  })
+
   it('attaches related test files from the confirmed implementation set instead of primary file discovery order', async () => {
     const { root, cleanup } = makeRepo()
     mkdirSync(join(root, 'tests'), { recursive: true })

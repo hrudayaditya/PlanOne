@@ -47,6 +47,7 @@ export interface PrioritizedFile {
   confidence: 'high' | 'medium' | 'low'
   reason: string
   lineCount: number
+  score?: number
 }
 
 export interface ConfirmedSymbol {
@@ -76,6 +77,12 @@ interface FileCandidate {
   path: string
   sourceKeys: Set<string>
   reasons: string[]
+}
+
+interface VerifiedLocation {
+  file: string
+  startLine: number
+  endLine: number
 }
 
 export interface ApproachMentions {
@@ -137,11 +144,12 @@ export async function buildImplementationSurface(
   seedFiles: string[] = []
 ): Promise<ImplementationSurface> {
   const candidates = new Map<string, FileCandidate>()
-  const confirmedSymbols: ConfirmedSymbol[] = []
+  const confirmedSymbols = seedConfirmedSymbolsFromVerifiedChunks(enrichedPacket, repoRoot)
   const searchHits: SearchHit[] = []
   const filteredNoiseSymbols: string[] = []
   const approachMentions = extractMentionsFromApproach(plan.approach)
   const approachSymbolHints = [...new Set(approachMentions.symbols)]
+  const verifiedLocations = parseVerifiedLocations(enrichedPacket.verifiedChunkIds, repoRoot)
 
   for (const filePath of seedFiles) {
     if (filePath.length > 0) {
@@ -216,10 +224,21 @@ export async function buildImplementationSurface(
           continue
         }
 
+        const startLine = result.start_line ?? 1
+        if (verifiedLocations.length > 0) {
+          const matchesVerified = getVerifiedLocationsForFile(filePath, verifiedLocations).some((location) => (
+            Math.abs(startLine - location.startLine) <= 20
+          ))
+
+          if (!matchesVerified) {
+            continue
+          }
+        }
+
         confirmedSymbols.push({
           name: result.name ?? result.symbol ?? symbolName,
           filePath,
-          startLine: result.start_line ?? 1,
+          startLine,
           endLine: result.end_line ?? result.start_line ?? 1
         })
         addCandidate(candidates, filePath, `symbol:${symbolName}`, `confirmed symbol ${symbolName}`)
@@ -231,6 +250,21 @@ export async function buildImplementationSurface(
     for (const hit of searchForSymbolHits(repoRoot, symbolName)) {
       searchHits.push(hit)
       addCandidate(candidates, hit.file, `grep:${symbolName}:${hit.file}:${hit.line}`, `local search hit for ${symbolName}`)
+    }
+  }
+
+  for (const candidate of candidates.values()) {
+    const verifiedMatches = getVerifiedLocationsForFile(candidate.path, verifiedLocations)
+    if (verifiedMatches.length === 0) {
+      continue
+    }
+
+    candidate.sourceKeys.add('verified_location')
+    for (const match of verifiedMatches) {
+      const reason = `verified chunk at line ${match.startLine}`
+      if (!candidate.reasons.includes(reason)) {
+        candidate.reasons.push(reason)
+      }
     }
   }
 
@@ -280,7 +314,8 @@ export async function buildImplementationSurface(
     try {
       const absolutePath = resolve(repoRoot, file.path)
       const content = readFileSync(absolutePath, 'utf8')
-      fileContents.set(file.path, truncateFileContent(content, PRELOAD_MAX_LINES))
+      const verifiedWindow = buildVerifiedFileWindow(file.path, content, verifiedLocations)
+      fileContents.set(file.path, verifiedWindow ?? truncateFileContent(content, PRELOAD_MAX_LINES))
     } catch {
       // Ignore unreadable files and preserve a non-throwing surface build.
     }
@@ -293,6 +328,32 @@ export async function buildImplementationSurface(
     searchHits: dedupeSearchHits(searchHits),
     relatedTestFiles: []
   }
+}
+
+function seedConfirmedSymbolsFromVerifiedChunks(
+  enrichedPacket: EnrichedPacket,
+  repoRoot: string
+): ConfirmedSymbol[] {
+  const verifiedLocations = parseVerifiedLocations(enrichedPacket.verifiedChunkIds, repoRoot)
+  const seeded: ConfirmedSymbol[] = []
+  const limit = Math.min(enrichedPacket.affectedSymbols.length, verifiedLocations.length)
+
+  for (let index = 0; index < limit; index += 1) {
+    const name = enrichedPacket.affectedSymbols[index]?.trim() ?? ''
+    const location = verifiedLocations[index]
+    if (name.length === 0 || location === undefined || location.startLine <= 0) {
+      continue
+    }
+
+    seeded.push({
+      name,
+      filePath: location.file,
+      startLine: location.startLine,
+      endLine: location.endLine
+    })
+  }
+
+  return seeded
 }
 
 export function attachRelatedTestFiles(
@@ -397,6 +458,35 @@ export function extractFilePathFromChunkId(chunkId: string, repoRoot: string): s
   return toRepoRelativePath(repoRoot, match[1])
 }
 
+function parseVerifiedLocations(chunkIds: string[], repoRoot: string): VerifiedLocation[] {
+  return chunkIds.flatMap((chunkId) => {
+    const match = chunkId.match(/((?:[A-Za-z]:)?[^:]+?\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?$/)
+    if (match?.[1] === undefined || match[2] === undefined) {
+      return []
+    }
+
+    const startLine = Number.parseInt(match[2], 10)
+    const endLine = Number.parseInt(match[3] ?? match[2], 10)
+    if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) {
+      return []
+    }
+
+    return [{
+      file: toRepoRelativePath(repoRoot, match[1]),
+      startLine,
+      endLine
+    }]
+  })
+}
+
+function getVerifiedLocationsForFile(filePath: string, verifiedLocations: VerifiedLocation[]): VerifiedLocation[] {
+  return verifiedLocations.filter((location) => (
+    filePath === location.file
+    || filePath.endsWith(`/${location.file}`)
+    || location.file.endsWith(`/${filePath}`)
+  ))
+}
+
 function normalizeSymbolFilePath(
   repoRoot: string,
   filePath?: string,
@@ -450,7 +540,8 @@ function toPrioritizedFile(candidate: FileCandidate, repoRoot: string): Prioriti
     path: candidate.path,
     confidence,
     reason: `${candidate.reasons[0] ?? 'selected by controller'} (${sourceCount} source${sourceCount === 1 ? '' : 's'}, ${points} point${points === 1 ? '' : 's'})`,
-    lineCount
+    lineCount,
+    score: points
   }
 }
 
@@ -463,6 +554,11 @@ function scoreCandidate(candidate: FileCandidate): number {
 
   for (const sourceKey of candidate.sourceKeys) {
     if (sourceKey.startsWith('seed:')) {
+      points += 10
+      continue
+    }
+
+    if (sourceKey === 'verified_location') {
       points += 10
       continue
     }
@@ -763,12 +859,42 @@ function countFileLines(repoRoot: string, filePath: string): number {
   }
 }
 
+function buildVerifiedFileWindow(
+  filePath: string,
+  content: string,
+  verifiedLocations: VerifiedLocation[]
+): string | null {
+  const match = getVerifiedLocationsForFile(filePath, verifiedLocations)[0]
+  if (match === undefined) {
+    return null
+  }
+
+  return readFileRangeWithLineNumbers(content, Math.max(1, match.startLine - 5), match.startLine + 80)
+}
+
+function readFileRangeWithLineNumbers(content: string, startLine: number, endLine: number): string {
+  const lines = content.split('\n')
+  const from = Math.max(1, startLine)
+  const to = Math.min(lines.length, Math.max(from, endLine))
+  const width = String(to).length
+
+  return lines
+    .slice(from - 1, to)
+    .map((line, index) => `${String(from + index).padStart(width, ' ')} | ${line}`)
+    .join('\n')
+}
+
 function comparePrioritizedFiles(left: PrioritizedFile, right: PrioritizedFile): number {
   const confidenceScore = { high: 3, medium: 2, low: 1 }
   const confidenceDiff = confidenceScore[right.confidence] - confidenceScore[left.confidence]
 
   if (confidenceDiff !== 0) {
     return confidenceDiff
+  }
+
+  const scoreDiff = (right.score ?? 0) - (left.score ?? 0)
+  if (scoreDiff !== 0) {
+    return scoreDiff
   }
 
   return left.path.localeCompare(right.path)
@@ -832,20 +958,23 @@ function runSearchProcess(binary: string, args: string[]): string | null {
 }
 
 function dedupeConfirmedSymbols(symbols: ConfirmedSymbol[]): ConfirmedSymbol[] {
-  const seen = new Set<string>()
-  const results: ConfirmedSymbol[] = []
+  const merged = new Map<string, ConfirmedSymbol>()
 
   for (const symbol of symbols) {
-    const key = `${symbol.name}:${symbol.filePath}:${symbol.startLine}:${symbol.endLine}`
-    if (seen.has(key)) {
+    const key = `${symbol.name}:${symbol.filePath}:${symbol.startLine}`
+    const existing = merged.get(key)
+    if (existing === undefined) {
+      merged.set(key, symbol)
       continue
     }
 
-    seen.add(key)
-    results.push(symbol)
+    merged.set(key, {
+      ...existing,
+      endLine: Math.max(existing.endLine, symbol.endLine)
+    })
   }
 
-  return results
+  return [...merged.values()]
 }
 
 function dedupeSearchHits(hits: SearchHit[]): SearchHit[] {

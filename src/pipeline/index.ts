@@ -1,5 +1,5 @@
 import { assignAbMode, type AbMode } from '../ab-test/index.js'
-import { createClient } from '../basememory/client.js'
+import { createClient, type BaseMemoryClient } from '../basememory/client.js'
 import { indexHealthCheck } from '../basememory/tools.js'
 import { EscalationRequired, type EscalationPackage } from '../escalation/index.js'
 import { runExecutor, type ExecutorResult } from '../executor/index.js'
@@ -11,10 +11,20 @@ import { OpenRouterProvider } from '../llm/openrouter.js'
 import { ContextDB } from '../memory/context-db/index.js'
 import { RawTraceStore } from '../memory/raw-trace-store/index.js'
 import { buildExecutionPlan } from '../orchestrator/index.js'
-import { runPanel, type PanelOutput } from '../panel/index.js'
+import type { PanelOutput } from '../panel/index.js'
+import { runDeterministicLocalization, type LocalizationResult } from '../panel/deterministic-localizer.js'
 import type { EnrichedPacket } from '../panel/synthesis.js'
+import type { CompressionLlmProvider } from '../executor/compression.js'
+import type { PanelMemberLlmProvider } from '../panel/member.js'
 import { logError, logInfo, logWarn } from '../utils/logger.js'
 import type { VerifierResult } from '../verifier/index.js'
+
+const USE_PANEL = false
+const passthroughCompressionProvider: CompressionLlmProvider = {
+  async distill(content: string) {
+    return content
+  }
+}
 
 /**
  * Static configuration for one top-level PlanOne pipeline run.
@@ -189,18 +199,25 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       abMode,
       rts
     })
-    const panelOutput = await runPanel(
-      {
+    const panelOutput = USE_PANEL
+      ? await import('../panel/index.js').then(({ runPanel }) => runPanel(
+        {
+          intake: intakeResult,
+          rts,
+          client: client as BaseMemoryClient,
+          contextDb,
+          fallbackModel: input.config.providerConfig.intakeModel,
+          localizationFallbackProvider
+        },
+        [],
+        providers.panelProvider
+      ))
+      : await buildPanelOutputFromLocalization({
         intake: intakeResult,
         rts,
-        client,
-        contextDb,
-        fallbackModel: input.config.providerConfig.intakeModel,
-        localizationFallbackProvider
-      },
-      [],
-      providers.panelProvider
-    )
+        provider: providers.intakeProvider as unknown as PanelMemberLlmProvider,
+        fallbackProvider: localizationFallbackProvider
+      })
     const plan = await buildExecutionPlan({
       enrichedPacket: panelOutput.enrichedPacket,
       intake: intakeResult,
@@ -221,7 +238,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
         repoRoot: input.config.repoRoot
       },
       providers.executorProvider,
-      providers.compressionProvider
+      passthroughCompressionProvider
     )
 
     if (executorResult.outcome === 'escalated') {
@@ -396,6 +413,83 @@ function formatKeyFingerprint(apiKey: string): string {
   const prefixLength = Math.min(12, apiKey.length)
   const suffixLength = Math.min(4, apiKey.length)
   return `len=${apiKey.length} prefix=${apiKey.slice(0, prefixLength)} suffix=${apiKey.slice(-suffixLength)}`
+}
+
+async function buildPanelOutputFromLocalization(input: {
+  intake: IntakeResult
+  rts: RawTraceStore
+  provider: PanelMemberLlmProvider
+  fallbackProvider?: PanelMemberLlmProvider
+}): Promise<PanelOutput> {
+  const startedAt = Date.now()
+  let localization: LocalizationResult
+  try {
+    localization = await runDeterministicLocalization({
+      intake: input.intake,
+      provider: input.provider,
+      fallbackProvider: input.fallbackProvider,
+      rts: input.rts
+    })
+  } catch (error) {
+    logWarn('pipeline', '[Pipeline] Deterministic localization failed in panel-bypass mode; using empty packet', {
+      error: error instanceof Error ? error.message : String(error)
+    })
+    localization = {
+      files: [],
+      symbols: [],
+      implementationContext: new Map(),
+      localizationMethod: 'fallback',
+      traceback: input.intake.reproductionResult?.traceback ?? null
+    }
+  }
+
+  return {
+    enrichedPacket: buildEnrichedPacketFromLocalization(localization, input.intake),
+    memberAnalyses: [],
+    citationResults: [],
+    panelDurationMs: Date.now() - startedAt
+  }
+}
+
+function buildEnrichedPacketFromLocalization(
+  localization: LocalizationResult,
+  intake: IntakeResult
+): EnrichedPacket {
+  const firstFile = localization.symbols[0]?.file ?? localization.files[0]?.path ?? ''
+  const firstSymbol = localization.symbols[0]?.name ?? ''
+  const approachText = intake.enhancedTask.structured_description
+  const verifiedChunkIds = localization.symbols.length > 0
+    ? localization.symbols.map((symbol) => `${symbol.file}:${symbol.lineNumber}-${symbol.lineNumber}`)
+    : localization.files.map((file) => `${file.path}:0-0`)
+
+  return {
+    taskId: intake.taskId,
+    originalTask: intake.enhancedTask.original,
+    structuredDescription: intake.enhancedTask.structured_description,
+    taskType: intake.enhancedTask.task_type,
+    affectedArea: intake.enhancedTask.affected_area,
+    affectedSymbols: localization.symbols.map((symbol) => symbol.name),
+    primaryRootCause: firstSymbol.length > 0
+      ? `Investigate ${firstSymbol} in ${firstFile}`
+      : `Investigate ${firstFile}`,
+    alternativeRootCauses: [],
+    rankedApproaches: [{
+      approach: approachText,
+      confidence: localization.localizationMethod === 'deterministic' ? 0.8 : 0.2,
+      rank: 1,
+      supportingChunkIds: verifiedChunkIds,
+      estimatedRisk: intake.classification.complexity === 'COMPLEX' ? 'high' : 'medium'
+    }],
+    identifiedRisks: [],
+    activeConstraints: [...intake.rules.always_escalate_if],
+    memberCount: 0,
+    consensusConfidence: localization.localizationMethod === 'deterministic' ? 0.8 : 0.2,
+    verifiedChunkIds,
+    citationVerificationDegraded: false,
+    implementationContext: Object.fromEntries(localization.implementationContext.entries()),
+    rules: intake.rules,
+    synthesizedAt: new Date().toISOString()
+  }
 }
 
 async function runOpenRouterPreflight(input: {

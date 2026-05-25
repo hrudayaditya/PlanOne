@@ -160,6 +160,372 @@ describe('deterministic localizer', () => {
     }
   })
 
+  it('parses fenced and varied symbol output formats and verifies igetattr', async () => {
+    const { root, cleanup } = makeRepo()
+    const { store, cleanup: cleanupStore } = makeStore()
+
+    const provider: PanelMemberLlmProvider = {
+      async analyze(prompt: string) {
+        if (prompt.includes('### Repository Structure ###')) {
+          return {
+            text: [
+              '```',
+              'astroid/scoped_nodes.py',
+              'tests/unittest_scoped_nodes.py',
+              '```'
+            ].join('\n'),
+            tokensUsed: 5,
+            costUsd: 0
+          }
+        }
+
+        return {
+          text: [
+            '```',
+            'astroid/scoped_nodes.py',
+            '    method: ClassDef.igetattr',
+            '    function: `declared_metaclass`',
+            '```'
+          ].join('\n'),
+          tokensUsed: 5,
+          costUsd: 0
+        }
+      }
+    }
+
+    try {
+      const result = await runDeterministicLocalization({
+        intake: makeIntake(root),
+        provider,
+        rts: store
+      })
+
+      expect(result.localizationMethod).toBe('deterministic')
+      expect(result.symbols).toEqual(expect.arrayContaining([
+        {
+          file: 'astroid/scoped_nodes.py',
+          name: 'igetattr',
+          type: 'function',
+          lineNumber: 2
+        }
+      ]))
+    } finally {
+      cleanupStore()
+      cleanup()
+    }
+  })
+
+  it('captures class methods in the Python skeleton with correct line numbers', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'planone-localizer-methods-'))
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    const { store, cleanup: cleanupStore } = makeStore()
+
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), [
+      'class LookupMixIn:',
+      '    def helper(self):',
+      '        return None',
+      '',
+      'class ClassDef(LookupMixIn):',
+      '    def igetattr(self, name, context=None):',
+      '        return self._get_attribute_from_metaclass(name, context)',
+      '',
+      'def helper_fn():',
+      '    return True'
+    ].join('\n'))
+
+    const provider: PanelMemberLlmProvider = {
+      async analyze(prompt: string) {
+        if (prompt.includes('### Repository Structure ###')) {
+          return {
+            text: '`astroid/scoped_nodes.py`',
+            tokensUsed: 5,
+            costUsd: 0
+          }
+        }
+
+        return {
+          text: [
+            'astroid/scoped_nodes.py',
+            '    function: missing_symbol'
+          ].join('\n'),
+          tokensUsed: 5,
+          costUsd: 0
+        }
+      }
+    }
+
+    try {
+      const result = await runDeterministicLocalization({
+        intake: makeIntake(root, 'Fix ClassDef.igetattr in astroid/scoped_nodes.py'),
+        provider,
+        rts: store
+      })
+
+      expect(result.symbols).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'astroid/scoped_nodes.py',
+          name: 'igetattr',
+          type: 'function',
+          lineNumber: 6
+        }),
+        expect.objectContaining({
+          file: 'astroid/scoped_nodes.py',
+          name: 'helper',
+          type: 'function',
+          lineNumber: 2
+        })
+      ]))
+    } finally {
+      cleanupStore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to primary skeleton functions when symbol verification produces no matches', async () => {
+    const { root, cleanup } = makeRepo()
+    const { store, cleanup: cleanupStore } = makeStore()
+
+    const provider: PanelMemberLlmProvider = {
+      async analyze(prompt: string) {
+        if (prompt.includes('### Repository Structure ###')) {
+          return {
+            text: '`astroid/scoped_nodes.py`',
+            tokensUsed: 5,
+            costUsd: 0
+          }
+        }
+
+        return {
+          text: [
+            'astroid/scoped_nodes.py',
+            '    function: not_a_real_symbol'
+          ].join('\n'),
+          tokensUsed: 5,
+          costUsd: 0
+        }
+      }
+    }
+
+    try {
+      const result = await runDeterministicLocalization({
+        intake: makeIntake(root),
+        provider,
+        rts: store
+      })
+
+      expect(result.localizationMethod).toBe('deterministic')
+      expect(result.symbols).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'astroid/scoped_nodes.py',
+          name: 'igetattr',
+          type: 'function'
+        }),
+        expect.objectContaining({
+          file: 'astroid/scoped_nodes.py',
+          name: 'helper',
+          type: 'function'
+        })
+      ]))
+    } finally {
+      cleanupStore()
+      cleanup()
+    }
+  })
+
+  it('captures bare line hints and includes the nearest fallback symbols', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'planone-localizer-fallback-'))
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    const { store, cleanup: cleanupStore } = makeStore()
+
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), [
+      'def early():',
+      '    return 1',
+      '',
+      ...Array.from({ length: 2510 }, () => 'pass'),
+      'def _get_attribute_from_metaclass():',
+      '    return "meta"',
+      '',
+      ...Array.from({ length: 24 }, () => 'pass'),
+      'def igetattr():',
+      '    return "target"',
+      '',
+      ...Array.from({ length: 65 }, () => 'pass'),
+      'def has_dynamic_getattr():',
+      '    return True',
+      '',
+      'def trailing():',
+      '    return None'
+    ].join('\n'))
+
+    const provider: PanelMemberLlmProvider = {
+      async analyze(prompt: string) {
+        if (prompt.includes('### Repository Structure ###')) {
+          return {
+            text: '`astroid/scoped_nodes.py`',
+            tokensUsed: 5,
+            costUsd: 0
+          }
+        }
+
+        return {
+          text: [
+            'astroid/scoped_nodes.py',
+            '    function: not_a_real_symbol'
+          ].join('\n'),
+          tokensUsed: 5,
+          costUsd: 0
+        }
+      }
+    }
+
+    try {
+      const result = await runDeterministicLocalization({
+        intake: makeIntake(
+          root,
+          'Looks like this is caused by astroid/scoped_nodes.py#L2590-L2603 in the derived-class metaclass path.'
+        ),
+        provider,
+        rts: store
+      })
+
+      expect(result.localizationMethod).toBe('deterministic')
+      expect(result.symbols).toHaveLength(5)
+      expect(result.symbols).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'igetattr', lineNumber: 2541 }),
+        expect.objectContaining({ name: '_get_attribute_from_metaclass', lineNumber: 2514 }),
+        expect.objectContaining({ name: 'has_dynamic_getattr', lineNumber: 2609 })
+      ]))
+    } finally {
+      cleanupStore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('force-includes traceback-named skeleton symbols during fallback', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'planone-localizer-traceback-'))
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    const { store, cleanup: cleanupStore } = makeStore()
+
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), [
+      'def early():',
+      '    return 1',
+      '',
+      ...Array.from({ length: 10 }, () => 'pass'),
+      'def helper():',
+      '    return 2',
+      '',
+      ...Array.from({ length: 10 }, () => 'pass'),
+      'def igetattr():',
+      '    return "target"',
+      '',
+      'def trailing():',
+      '    return None'
+    ].join('\n'))
+
+    const provider: PanelMemberLlmProvider = {
+      async analyze(prompt: string) {
+        if (prompt.includes('### Repository Structure ###')) {
+          return {
+            text: '`astroid/scoped_nodes.py`',
+            tokensUsed: 5,
+            costUsd: 0
+          }
+        }
+
+        return {
+          text: [
+            'astroid/scoped_nodes.py',
+            '    function: not_a_real_symbol'
+          ].join('\n'),
+          tokensUsed: 5,
+          costUsd: 0
+        }
+      }
+    }
+
+    try {
+      const result = await runDeterministicLocalization({
+        intake: makeIntake(
+          root,
+          'Metaclass property inference failed.\nTraceback\n  File "astroid/scoped_nodes.py", line 25, in igetattr'
+        ),
+        provider,
+        rts: store
+      })
+
+      expect(result.symbols).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'igetattr', type: 'function' })
+      ]))
+    } finally {
+      cleanupStore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses task line hints to pick the relevant duplicate symbol match', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'planone-localizer-dup-'))
+    mkdirSync(join(root, 'astroid'), { recursive: true })
+    const { store, cleanup: cleanupStore } = makeStore()
+
+    writeFileSync(join(root, 'astroid/scoped_nodes.py'), [
+      'def igetattr(self, name):',
+      '    return "early"',
+      '',
+      'def helper():',
+      '    return None',
+      '',
+      '# filler',
+      ...Array.from({ length: 2536 }, () => 'pass'),
+      'def igetattr(self, name, context=None):',
+      '    return self._get_attribute_from_metaclass(name, context)'
+    ].join('\n'))
+
+    const provider: PanelMemberLlmProvider = {
+      async analyze(prompt: string) {
+        if (prompt.includes('### Repository Structure ###')) {
+          return {
+            text: '`astroid/scoped_nodes.py`',
+            tokensUsed: 5,
+            costUsd: 0
+          }
+        }
+
+        return {
+          text: [
+            'astroid/scoped_nodes.py',
+            '    function: igetattr'
+          ].join('\n'),
+          tokensUsed: 5,
+          costUsd: 0
+        }
+      }
+    }
+
+    try {
+      const result = await runDeterministicLocalization({
+        intake: makeIntake(
+          root,
+          'Bug is around astroid/scoped_nodes.py#L2540-L2603 when Derived.__members__ is inferred.'
+        ),
+        provider,
+        rts: store
+      })
+
+      expect(result.localizationMethod).toBe('deterministic')
+      expect(result.symbols).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'astroid/scoped_nodes.py',
+          name: 'igetattr',
+          type: 'function',
+          lineNumber: 2544
+        })
+      ]))
+    } finally {
+      cleanupStore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('falls back when no verified file can be localized', async () => {
     const { root, cleanup } = makeRepo()
     const { store, cleanup: cleanupStore } = makeStore()

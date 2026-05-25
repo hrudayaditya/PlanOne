@@ -397,10 +397,15 @@ async function localizeSymbols(input: {
       continue
     }
 
+    const fileLineHints = extractLineHintsForFile(input.problemStatement, input.traceback, entry.file)
+
     for (const symbol of entry.symbols) {
-      const match = skeleton.symbols.find((candidate) => (
-        candidate.name === symbol.name && candidate.type === symbol.type
-      ))
+      const match = selectBestSkeletonSymbolMatch(
+        skeleton.symbols,
+        symbol.name,
+        symbol.type,
+        fileLineHints
+      )
 
       if (match !== undefined) {
         verified.push({
@@ -415,6 +420,44 @@ async function localizeSymbols(input: {
           symbol: symbol.name
         })
       }
+    }
+  }
+
+  if (verified.length === 0 && input.skeletons.length > 0) {
+    const primarySkeleton = input.skeletons[0]
+    if (primarySkeleton !== undefined) {
+      const fallbackSymbols = selectSkeletonFallbackSymbols(
+        primarySkeleton.symbols,
+        extractLineHintsForFile(input.problemStatement, input.traceback, primarySkeleton.path),
+        5
+      )
+      const preferredSymbols = extractPreferredFallbackSymbols(
+        input.problemStatement,
+        input.traceback,
+        primarySkeleton
+      )
+      const fallbackWithPreferred = [...fallbackSymbols]
+
+      for (const symbol of preferredSymbols) {
+        if (fallbackWithPreferred.some((candidate) => candidate.name === symbol.name && candidate.type === symbol.type)) {
+          continue
+        }
+        fallbackWithPreferred.push(symbol)
+      }
+
+      for (const symbol of fallbackWithPreferred) {
+        verified.push({
+          file: primarySkeleton.path,
+          name: symbol.name,
+          type: symbol.type,
+          lineNumber: symbol.lineNumber
+        })
+      }
+
+      logWarn('panel:localizer', '[Localizer] Symbol verification produced no results. Using skeleton fallback.', {
+        file: primarySkeleton.path,
+        symbolCount: fallbackWithPreferred.length
+      })
     }
   }
 
@@ -554,15 +597,24 @@ function verifyFilePath(repoRoot: string, filePath: string): VerifiedFile | null
 }
 
 function parseBacktickedFilePaths(text: string): string[] {
-  const backticked = [...text.matchAll(/`([^`]+)`/g)].map((match) => match[1] ?? '').filter((value) => value.length > 0)
+  const backticked = [...text.matchAll(/`([^`]+)`/g)]
+    .map((match) => match[1] ?? '')
+    .flatMap((value) => value.split('\n'))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
   if (backticked.length > 0) {
-    return backticked
+    return backticked.slice(0, MAX_LOCALIZATION_FILES)
   }
 
-  return text
+  const stripped = text
+    .replace(/^```[a-z]*\n?/im, '')
+    .replace(/\n?```$/im, '')
+    .trim()
+
+  return stripped
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line.length > 0)
+    .filter((line) => line.length > 0 && !line.startsWith('```'))
     .slice(0, MAX_LOCALIZATION_FILES)
 }
 
@@ -653,11 +705,29 @@ function extractPythonSkeletonSymbols(
     const script = [
       'import ast, sys',
       'tree = ast.parse(open(sys.argv[1]).read())',
-      'for node in ast.walk(tree):',
+      'symbols = []',
+      '',
+      'def walk(node):',
+      '    if isinstance(node, ast.ClassDef):',
+      '        symbols.append(("class", node.name, node.lineno))',
+      '        for item in node.body:',
+      '            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):',
+      '                symbols.append(("function", item.name, item.lineno))',
+      '        for item in node.body:',
+      '            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):',
+      '                walk(item)',
+      '        return',
+      '',
       '    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):',
-      '        print(f"function\\t{node.name}\\t{node.lineno}")',
-      '    elif isinstance(node, ast.ClassDef):',
-      '        print(f"class\\t{node.name}\\t{node.lineno}")'
+      '        symbols.append(("function", node.name, node.lineno))',
+      '        return',
+      '',
+      '    for child in ast.iter_child_nodes(node):',
+      '        walk(child)',
+      '',
+      'walk(tree)',
+      'for symbol_type, name, lineno in symbols:',
+      '    print(f"{symbol_type}\\t{name}\\t{lineno}")'
     ].join('\n')
     const output = execFileSync(binary, ['-c', script, absolutePath], { encoding: 'utf8' })
     return output
@@ -679,19 +749,35 @@ function extractPythonSkeletonSymbols(
       .filter((symbol): symbol is SkeletonSymbol => symbol !== null)
       .sort((left, right) => left.lineNumber - right.lineNumber)
   } catch {
-    return source
-      .split('\n')
-      .flatMap((line, index): SkeletonSymbol[] => {
-        const classMatch = line.match(/^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)/)
-        if (classMatch?.[1] !== undefined) {
-          return [{ type: 'class', name: classMatch[1], lineNumber: index + 1 }]
-        }
-        const functionMatch = line.match(/^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)/)
-        if (functionMatch?.[1] !== undefined) {
-          return [{ type: 'function', name: functionMatch[1], lineNumber: index + 1 }]
-        }
-        return []
-      })
+    const symbols: SkeletonSymbol[] = []
+    const classIndents: number[] = []
+
+    for (const [index, line] of source.split('\n').entries()) {
+      if (line.trim().length === 0) {
+        continue
+      }
+
+      const indentMatch = line.match(/^[ \t]*/)
+      const indent = indentMatch?.[0]?.replace(/\t/g, '    ').length ?? 0
+
+      while (classIndents.length > 0 && indent <= (classIndents[classIndents.length - 1] ?? 0)) {
+        classIndents.pop()
+      }
+
+      const classMatch = line.match(/^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)/)
+      if (classMatch?.[1] !== undefined) {
+        symbols.push({ type: 'class', name: classMatch[1], lineNumber: index + 1 })
+        classIndents.push(indent)
+        continue
+      }
+
+      const functionMatch = line.match(/^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)/)
+      if (functionMatch?.[1] !== undefined && (classIndents.length > 0 || indent === 0)) {
+        symbols.push({ type: 'function', name: functionMatch[1], lineNumber: index + 1 })
+      }
+    }
+
+    return symbols
   }
 }
 
@@ -724,32 +810,213 @@ function parseSymbolLocalizationResponse(text: string): Array<{
   file: string
   symbols: Array<{ type: SkeletonSymbol['type']; name: string }>
 }> {
-  const lines = text.split('\n')
+  const stripped = text
+    .replace(/^```[a-z]*\n?/gim, '')
+    .replace(/^```\n?/gim, '')
+    .trim()
+
+  const lines = stripped.split('\n')
   const entries: Array<{ file: string; symbols: Array<{ type: SkeletonSymbol['type']; name: string }> }> = []
   let currentFile: { file: string; symbols: Array<{ type: SkeletonSymbol['type']; name: string }> } | null = null
 
   for (const line of lines) {
-    const trimmed = line.trimEnd()
-    if (trimmed.trim().length === 0) {
+    const trimmed = line.trim()
+    if (trimmed.length === 0) {
       continue
     }
 
-    if (!trimmed.startsWith(' ') && !trimmed.startsWith('\t') && !trimmed.includes(': ')) {
-      currentFile = { file: trimmed.trim(), symbols: [] }
-      entries.push(currentFile)
-      continue
-    }
+    const symbolMatch = trimmed.match(/^(?:\s+)?(function|method|class|variable):\s+(.+)$/i)
+    if (symbolMatch?.[1] !== undefined && symbolMatch[2] !== undefined) {
+      if (currentFile === null) {
+        continue
+      }
 
-    const symbolMatch = trimmed.match(/^\s*(function|class|variable):\s+(.+)$/)
-    if (symbolMatch?.[1] !== undefined && symbolMatch[2] !== undefined && currentFile !== null) {
+      let rawName = symbolMatch[2].trim().replace(/`/g, '').trim()
+      if (rawName.includes('.')) {
+        rawName = rawName.split('.').pop() ?? rawName
+      }
+      const rawType = symbolMatch[1].toLowerCase()
+      const symbolType: SkeletonSymbol['type'] = rawType === 'class'
+        ? 'class'
+        : rawType === 'variable'
+          ? 'variable'
+          : 'function'
+
       currentFile.symbols.push({
-        type: symbolMatch[1] as SkeletonSymbol['type'],
-        name: symbolMatch[2].trim()
+        type: symbolType,
+        name: rawName
       })
+      continue
+    }
+
+    if (!line.startsWith(' ') && !line.startsWith('\t') && trimmed.length > 0) {
+      currentFile = { file: trimmed.replace(/`/g, '').trim(), symbols: [] }
+      entries.push(currentFile)
     }
   }
 
   return entries
+}
+
+function selectBestSkeletonSymbolMatch(
+  candidates: SkeletonSymbol[],
+  symbolName: string,
+  symbolType: SkeletonSymbol['type'],
+  fileLineHints: number[]
+): SkeletonSymbol | undefined {
+  const matches = candidates.filter((candidate) => (
+    candidate.name === symbolName && candidate.type === symbolType
+  ))
+
+  if (matches.length <= 1) {
+    return matches[0]
+  }
+
+  if (fileLineHints.length === 0) {
+    return matches[matches.length - 1]
+  }
+
+  return [...matches].sort((left, right) => {
+    const leftDistance = minimumLineDistance(left.lineNumber, fileLineHints)
+    const rightDistance = minimumLineDistance(right.lineNumber, fileLineHints)
+    if (leftDistance !== rightDistance) {
+      return leftDistance - rightDistance
+    }
+
+    return right.lineNumber - left.lineNumber
+  })[0]
+}
+
+function minimumLineDistance(lineNumber: number, hints: number[]): number {
+  return hints.reduce((best, hint) => Math.min(best, Math.abs(lineNumber - hint)), Number.POSITIVE_INFINITY)
+}
+
+function selectSkeletonFallbackSymbols(
+  symbols: SkeletonSymbol[],
+  lineHints: number[],
+  limit = 3
+): SkeletonSymbol[] {
+  const functions = symbols.filter((symbol) => symbol.type === 'function')
+  if (functions.length <= limit) {
+    return functions
+  }
+
+  if (lineHints.length === 0) {
+    return functions.slice(0, limit)
+  }
+
+  return [...functions]
+    .sort((left, right) => compareFallbackCandidates(left, right, lineHints))
+    .slice(0, limit)
+}
+
+function compareFallbackCandidates(
+  left: SkeletonSymbol,
+  right: SkeletonSymbol,
+  lineHints: number[]
+): number {
+  const leftScore = contextualLineDistance(left.lineNumber, lineHints)
+  const rightScore = contextualLineDistance(right.lineNumber, lineHints)
+
+  if (leftScore !== rightScore) {
+    return leftScore - rightScore
+  }
+
+  return right.lineNumber - left.lineNumber
+}
+
+function contextualLineDistance(lineNumber: number, hints: number[]): number {
+  let best = Number.POSITIVE_INFINITY
+
+  for (const hint of hints) {
+    const score = lineNumber <= hint
+      ? hint - lineNumber
+      : (lineNumber - hint) + 80
+    best = Math.min(best, score)
+  }
+
+  return best
+}
+
+function extractLineHintsForFile(
+  problemStatement: string,
+  traceback: string | null,
+  filePath: string
+): number[] {
+  const hints = new Set<number>()
+  const normalizedFilePath = escapeRegex(filePath.replace(/\\/g, '/'))
+  const normalizedBasename = escapeRegex(filePath.split('/').at(-1) ?? filePath)
+  const linePatterns = [
+    new RegExp(`${normalizedFilePath}#L(\\d+)(?:-L?(\\d+))?`, 'gi'),
+    new RegExp(`${normalizedBasename}#L(\\d+)(?:-L?(\\d+))?`, 'gi'),
+    new RegExp(`File "\\/?[^"\\n]*${normalizedFilePath}", line (\\d+)`, 'gi'),
+    new RegExp(`File "\\/?[^"\\n]*${normalizedBasename}", line (\\d+)`, 'gi')
+  ]
+
+  for (const source of [problemStatement, traceback ?? '']) {
+    const barePattern = /#L(\d+)(?:-L?(\d+))?/gi
+    for (const match of source.matchAll(barePattern)) {
+      const first = Number.parseInt(match[1] ?? '', 10)
+      const second = Number.parseInt(match[2] ?? '', 10)
+
+      if (Number.isFinite(first) && first > 0) {
+        hints.add(first)
+      }
+
+      if (Number.isFinite(second) && second > 0) {
+        for (let line = first; line <= second; line += 1) {
+          hints.add(line)
+        }
+      }
+    }
+
+    for (const pattern of linePatterns) {
+      for (const match of source.matchAll(pattern)) {
+        const first = Number.parseInt(match[1] ?? '', 10)
+        const second = Number.parseInt(match[2] ?? '', 10)
+
+        if (Number.isFinite(first) && first > 0) {
+          hints.add(first)
+        }
+
+        if (Number.isFinite(second) && second > 0) {
+          hints.add(second)
+        }
+      }
+    }
+  }
+
+  return [...hints]
+}
+
+function extractPreferredFallbackSymbols(
+  problemStatement: string,
+  traceback: string | null,
+  skeleton: FileSkeleton
+): SkeletonSymbol[] {
+  const preferredNames = new Set<string>()
+
+  for (const source of [problemStatement, traceback ?? '']) {
+    for (const match of source.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`/g)) {
+      if (match[1] !== undefined) {
+        preferredNames.add(match[1])
+      }
+    }
+
+    for (const match of source.matchAll(/\bin ([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+      if (match[1] !== undefined) {
+        preferredNames.add(match[1])
+      }
+    }
+  }
+
+  return skeleton.symbols.filter((symbol) => (
+    symbol.type === 'function' && preferredNames.has(symbol.name)
+  ))
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function extractImplementationContext(

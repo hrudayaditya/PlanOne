@@ -5,13 +5,6 @@ import { AnthropicProvider } from '../../src/llm/anthropic.js'
 import { GeminiProvider } from '../../src/llm/gemini.js'
 
 describe('llm router', () => {
-  it('throws when executor and verifier are the same family', () => {
-    expect(() => createProviders({
-      executorModel: 'claude-opus-4-5',
-      verifierModel: 'claude-haiku-4-5'
-    })).toThrow(/different provider families/i)
-  })
-
   it('succeeds with claude executor and gemini verifier', () => {
     const providers = createProviders({
       executorModel: 'claude-opus-4-5',

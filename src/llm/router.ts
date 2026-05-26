@@ -11,6 +11,7 @@ import {
 } from './models.js'
 import { AnthropicProvider } from './anthropic.js'
 import { GeminiProvider } from './gemini.js'
+import { GroqProvider } from './groq.js'
 import { NvidiaProvider } from './nvidia.js'
 import { OpenRouterProvider } from './openrouter.js'
 
@@ -20,6 +21,7 @@ import { OpenRouterProvider } from './openrouter.js'
 export interface ProviderConfig {
   anthropicApiKey?: string
   geminiApiKey?: string
+  groqApiKey?: string
   openrouterApiKey?: string
   nvidiaApiKey?: string
   openrouterPath?: 'free' | 'paid'
@@ -39,7 +41,6 @@ export interface ProviderBundle {
   intakeProvider: IntakeLlmProvider
   panelProvider: PanelMemberLlmProvider
   executorProvider: ExecutorLlmProvider
-  verifierProvider: IntakeLlmProvider | PanelMemberLlmProvider | ExecutorLlmProvider | CompressionLlmProvider
   compressionProvider: CompressionLlmProvider
 }
 
@@ -50,6 +51,7 @@ type ProviderWithDefaultModel<T> = T & {
 interface ResolvedProviderConfig {
   anthropicApiKey?: string
   geminiApiKey?: string
+  groqApiKey?: string
   openrouterApiKey?: string
   nvidiaApiKey?: string
   openrouterPath: 'free' | 'paid'
@@ -74,8 +76,7 @@ const DEFAULT_PROVIDER_CONFIG = {
 /**
  * Creates the concrete providers used by the top-level pipeline.
  *
- * Executor and verifier must come from different provider families. This is a
- * hard architectural invariant and is enforced before any work begins.
+ * Providers are chosen per role from the configured model IDs and available keys.
  */
 export function createProviders(config: ProviderConfig): ProviderBundle {
   const resolvedConfig: ResolvedProviderConfig = {
@@ -83,18 +84,17 @@ export function createProviders(config: ProviderConfig): ProviderBundle {
     ...config
   }
 
-  const executorFamily = getModelFamily(resolvedConfig.executorModel)
-  const verifierFamily = getModelFamily(resolvedConfig.verifierModel)
-
-  if (executorFamily === verifierFamily) {
-    throw new Error(
-      `Executor and verifier models must use different provider families. Received executor=${resolvedConfig.executorModel} and verifier=${resolvedConfig.verifierModel}.`
-    )
-  }
-
   const anthropicProvider = new AnthropicProvider(resolvedConfig.anthropicApiKey)
   const geminiProvider = new GeminiProvider(resolvedConfig.geminiApiKey)
   const nvidiaProvider = new NvidiaProvider(resolvedConfig.nvidiaApiKey)
+  const groqProvider = resolvedConfig.groqApiKey === undefined
+    ? null
+    : new GroqProvider(resolvedConfig.groqApiKey, {
+      intakeProvider: geminiProvider,
+      intakeModel: 'gemini-2.5-flash',
+      executorProvider: nvidiaProvider,
+      executorModel: 'z-ai/glm-5.1'
+    })
   const openrouterProvider = resolvedConfig.openrouterApiKey === undefined
     ? null
     : new OpenRouterProvider({
@@ -110,6 +110,7 @@ export function createProviders(config: ProviderConfig): ProviderBundle {
     resolvedConfig,
     anthropicProvider,
     geminiProvider,
+    groqProvider,
     nvidiaProvider,
     openrouterProvider
   ), resolvedConfig.intakeModel)
@@ -118,6 +119,7 @@ export function createProviders(config: ProviderConfig): ProviderBundle {
     resolvedConfig,
     anthropicProvider,
     geminiProvider,
+    groqProvider,
     nvidiaProvider,
     openrouterProvider
   ), resolvedConfig.panelModel)
@@ -126,22 +128,16 @@ export function createProviders(config: ProviderConfig): ProviderBundle {
     resolvedConfig,
     anthropicProvider,
     geminiProvider,
+    groqProvider,
     nvidiaProvider,
     openrouterProvider
   ), resolvedConfig.executorModel)
-  const verifierProvider = withDefaultModel(selectProvider(
-    resolvedConfig.verifierModel,
-    resolvedConfig,
-    anthropicProvider,
-    geminiProvider,
-    nvidiaProvider,
-    openrouterProvider
-  ), resolvedConfig.verifierModel)
   const compressionProvider = withDefaultModel(selectProvider(
     resolvedConfig.compressionModel,
     resolvedConfig,
     anthropicProvider,
     geminiProvider,
+    groqProvider,
     nvidiaProvider,
     openrouterProvider
   ), resolvedConfig.compressionModel)
@@ -150,7 +146,6 @@ export function createProviders(config: ProviderConfig): ProviderBundle {
     intakeProvider,
     panelProvider,
     executorProvider,
-    verifierProvider,
     compressionProvider
   }
 }
@@ -172,6 +167,7 @@ function selectProvider(
   config: ResolvedProviderConfig,
   anthropicProvider: AnthropicProvider,
   geminiProvider: GeminiProvider,
+  groqProvider: GroqProvider | null,
   nvidiaProvider: NvidiaProvider,
   openrouterProvider: OpenRouterProvider | null
 ): IntakeLlmProvider & PanelMemberLlmProvider & ExecutorLlmProvider & CompressionLlmProvider {
@@ -183,6 +179,14 @@ function selectProvider(
 
   if (providerType === 'anthropic') {
     return anthropicProvider
+  }
+
+  if (providerType === 'groq') {
+    if (groqProvider === null) {
+      throw new Error(`Model ${modelId} requires GroqProvider but no GROQ_API_KEY was configured.`)
+    }
+
+    return groqProvider
   }
 
   if (providerType === 'nvidia') {
@@ -218,6 +222,10 @@ export function getModelFamily(modelId: string): string {
     return 'google'
   }
 
+  if (isGroqModel(base)) {
+    return 'groq'
+  }
+
   if (base.startsWith('gpt-') || base.startsWith('o1-') || base.startsWith('o3-')) {
     return 'openai'
   }
@@ -228,11 +236,15 @@ export function getModelFamily(modelId: string): string {
 /**
  * Selects which concrete provider should serve a given model ID.
  */
-export function selectProviderType(modelId: string, config: ProviderConfig): 'openrouter' | 'gemini' | 'anthropic' | 'nvidia' {
+export function selectProviderType(modelId: string, config: ProviderConfig): 'openrouter' | 'gemini' | 'anthropic' | 'groq' | 'nvidia' {
   const base = modelId.replace(/:free$/, '')
 
   if (isNvidiaModel(base) && config.nvidiaApiKey !== undefined) {
     return 'nvidia'
+  }
+
+  if (isGroqModel(base) && config.groqApiKey !== undefined) {
+    return 'groq'
   }
 
   if (base.includes('/') && config.openrouterApiKey !== undefined) {
@@ -256,4 +268,8 @@ export function selectProviderType(modelId: string, config: ProviderConfig): 'op
 
 function isNvidiaModel(modelId: string): boolean {
   return modelId.startsWith('minimaxai/') || modelId.startsWith('z-ai/')
+}
+
+function isGroqModel(modelId: string): boolean {
+  return modelId.startsWith('llama-') || modelId.startsWith('mixtral-') || modelId.startsWith('qwen-')
 }

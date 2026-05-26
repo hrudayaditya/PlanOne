@@ -59,7 +59,6 @@ describe('pipeline integration', () => {
       intakeProvider: { generateJson: vi.fn() },
       panelProvider: { analyze: vi.fn() },
       executorProvider: { generatePreActionPlan: vi.fn(), callWithTools: vi.fn() },
-      verifierProvider: { analyze: vi.fn() },
       compressionProvider: { distill: vi.fn() }
     })
     runIntakeMock.mockResolvedValue(makeIntake())
@@ -112,7 +111,6 @@ describe('pipeline integration', () => {
       intakeProvider: { generateJson: vi.fn() },
       panelProvider: { analyze: vi.fn() },
       executorProvider: { generatePreActionPlan: vi.fn(), callWithTools: vi.fn() },
-      verifierProvider: { analyze: vi.fn() },
       compressionProvider: { distill: vi.fn() }
     })
     runIntakeMock.mockResolvedValue(makeIntake())
@@ -153,7 +151,6 @@ describe('pipeline integration', () => {
       intakeProvider: { generateJson: vi.fn() },
       panelProvider: { analyze: vi.fn() },
       executorProvider: { generatePreActionPlan: vi.fn(), callWithTools: vi.fn() },
-      verifierProvider: { analyze: vi.fn() },
       compressionProvider: { distill: vi.fn() }
     })
     runIntakeMock.mockResolvedValue(makeIntake())
@@ -184,7 +181,6 @@ describe('pipeline integration', () => {
       intakeProvider: { generateJson: vi.fn() },
       panelProvider: { analyze: vi.fn() },
       executorProvider: { generatePreActionPlan: vi.fn(), callWithTools: vi.fn() },
-      verifierProvider: { analyze: vi.fn() },
       compressionProvider: { distill: vi.fn() }
     })
     runIntakeMock.mockResolvedValue(makeIntake())
@@ -214,7 +210,6 @@ describe('pipeline integration', () => {
       intakeProvider: { generateJson: vi.fn() },
       panelProvider: { analyze: vi.fn() },
       executorProvider: { generatePreActionPlan: vi.fn(), callWithTools: vi.fn() },
-      verifierProvider: { analyze: vi.fn() },
       compressionProvider: { distill: vi.fn() }
     })
     runIntakeMock.mockResolvedValue(makeIntake())

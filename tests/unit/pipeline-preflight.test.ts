@@ -14,7 +14,6 @@ function makeBundle(overrides: Partial<ProviderBundle>): ProviderBundle {
     intakeProvider: gemini,
     panelProvider: gemini,
     executorProvider: gemini,
-    verifierProvider: gemini,
     compressionProvider: gemini,
     ...overrides
   }

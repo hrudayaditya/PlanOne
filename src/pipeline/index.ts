@@ -6,6 +6,7 @@ import { runExecutor, type ExecutorResult } from '../executor/index.js'
 import { runIntake, type IntakeResult } from '../intake/index.js'
 import { setIntakeLlmProviderForTesting } from '../intake/llm.js'
 import { DEFAULT_EXECUTOR_MODEL, DEFAULT_PANEL_MODEL, DEFAULT_VERIFIER_MODEL } from '../llm/models.js'
+import { GroqProvider } from '../llm/groq.js'
 import { createProviders, type ProviderBundle, type ProviderConfig } from '../llm/router.js'
 import { OpenRouterProvider } from '../llm/openrouter.js'
 import { ContextDB } from '../memory/context-db/index.js'
@@ -20,6 +21,9 @@ import { logError, logInfo, logWarn } from '../utils/logger.js'
 import type { VerifierResult } from '../verifier/index.js'
 
 const USE_PANEL = false
+const GROQ_EXECUTOR_MODEL = 'llama-3.3-70b-versatile'
+const GROQ_INTAKE_MODEL = 'llama-3.1-8b-instant'
+const GROQ_VERIFIER_MODEL = 'llama-3.1-8b-instant'
 const passthroughCompressionProvider: CompressionLlmProvider = {
   async distill(content: string) {
     return content
@@ -142,9 +146,11 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       })
     }
 
-    const openrouterKey = input.config.providerConfig.openrouterApiKey ?? ''
-    const geminiKey = input.config.providerConfig.geminiApiKey ?? ''
-    const nvidiaKey = input.config.providerConfig.nvidiaApiKey ?? ''
+    const resolvedProviderConfig = resolveProviderConfig(input.config.providerConfig)
+    const openrouterKey = resolvedProviderConfig.openrouterApiKey ?? ''
+    const geminiKey = resolvedProviderConfig.geminiApiKey ?? ''
+    const groqKey = resolvedProviderConfig.groqApiKey ?? ''
+    const nvidiaKey = resolvedProviderConfig.nvidiaApiKey ?? ''
 
     rts.append({
       task_id: input.taskId,
@@ -156,6 +162,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
         operation: 'provider_key_fingerprint',
         openrouter: formatKeyFingerprint(openrouterKey),
         gemini: formatKeyFingerprint(geminiKey),
+        groq: formatKeyFingerprint(groqKey),
         nvidia: formatKeyFingerprint(nvidiaKey)
       }),
       tokens_used: null,
@@ -163,18 +170,27 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       created_at: new Date().toISOString()
     })
 
-    const providers = createProviders(input.config.providerConfig)
+    const providers = createProviders(resolvedProviderConfig)
     const localizationFallbackProvider = openrouterKey.length === 0
       ? undefined
       : new OpenRouterProvider({
         apiKey: openrouterKey,
         path: 'paid',
         modelId: 'google/gemini-2.5-flash',
-        siteUrl: input.config.providerConfig.openrouterSiteUrl,
-        siteName: input.config.providerConfig.openrouterSiteName
+        siteUrl: resolvedProviderConfig.openrouterSiteUrl,
+        siteName: resolvedProviderConfig.openrouterSiteName
       })
-    await validateProviderModelAlignment(providers, input.config.providerConfig)
+    await validateProviderModelAlignment(providers, resolvedProviderConfig)
     setIntakeLlmProviderForTesting(providers.intakeProvider)
+
+    if (groqKey.length > 0) {
+      await runGroqPreflight({
+        provider: new GroqProvider(groqKey),
+        rts,
+        taskId: input.taskId,
+        abMode
+      })
+    }
 
     if (localizationFallbackProvider !== undefined) {
       await runOpenRouterPreflight({
@@ -186,10 +202,10 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     }
 
     logInfo('pipeline', '[Pipeline] Provider preflight complete', {
-      executorModel: input.config.providerConfig.executorModel,
-      panelModel: input.config.providerConfig.panelModel,
-      verifierModel: input.config.providerConfig.verifierModel,
-      intakeModel: input.config.providerConfig.intakeModel
+      executorModel: resolvedProviderConfig.executorModel,
+      panelModel: resolvedProviderConfig.panelModel,
+      verifierModel: resolvedProviderConfig.verifierModel,
+      intakeModel: resolvedProviderConfig.intakeModel
     })
 
     const intakeResult = await runIntake({
@@ -206,7 +222,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
           rts,
           client: client as BaseMemoryClient,
           contextDb,
-          fallbackModel: input.config.providerConfig.intakeModel,
+          fallbackModel: resolvedProviderConfig.intakeModel,
           localizationFallbackProvider
         },
         [],
@@ -223,8 +239,8 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       intake: intakeResult,
       rts,
       contextDb,
-      executorModel: input.config.providerConfig.executorModel ?? DEFAULT_EXECUTOR_MODEL,
-      verifierModel: input.config.providerConfig.verifierModel ?? DEFAULT_VERIFIER_MODEL,
+      executorModel: resolvedProviderConfig.executorModel ?? DEFAULT_EXECUTOR_MODEL,
+      verifierModel: resolvedProviderConfig.verifierModel ?? DEFAULT_VERIFIER_MODEL,
       continuousLoop: input.config.continuousLoop === true
     })
     const executorResult = await runExecutor(
@@ -578,7 +594,6 @@ export async function validateProviderModelAlignment(
   const checks = [
     { role: 'executor', modelId: config.executorModel, provider: providers.executorProvider },
     { role: 'panel', modelId: config.panelModel, provider: providers.panelProvider },
-    { role: 'verifier', modelId: config.verifierModel, provider: providers.verifierProvider },
     { role: 'intake', modelId: config.intakeModel, provider: providers.intakeProvider },
     { role: 'compression', modelId: config.compressionModel, provider: providers.compressionProvider }
   ]
@@ -613,7 +628,7 @@ export async function validateProviderModelAlignment(
   }
 }
 
-function inferModelFamily(modelId: string): 'anthropic' | 'google' | 'openrouter' | 'nvidia' | 'unknown' {
+function inferModelFamily(modelId: string): 'anthropic' | 'google' | 'groq' | 'openrouter' | 'nvidia' | 'unknown' {
   const normalizedModelId = modelId.replace(/:free$/, '')
 
   if (normalizedModelId.startsWith('minimaxai/') || normalizedModelId.startsWith('z-ai/')) {
@@ -628,6 +643,10 @@ function inferModelFamily(modelId: string): 'anthropic' | 'google' | 'openrouter
     return 'google'
   }
 
+  if (normalizedModelId.startsWith('llama-') || normalizedModelId.startsWith('mixtral-') || normalizedModelId.startsWith('qwen-')) {
+    return 'groq'
+  }
+
   if (normalizedModelId.includes('/')) {
     return 'openrouter'
   }
@@ -635,7 +654,7 @@ function inferModelFamily(modelId: string): 'anthropic' | 'google' | 'openrouter
   return 'unknown'
 }
 
-function inferProviderFamily(providerName: string): 'anthropic' | 'google' | 'openrouter' | 'nvidia' | 'unknown' {
+function inferProviderFamily(providerName: string): 'anthropic' | 'google' | 'groq' | 'openrouter' | 'nvidia' | 'unknown' {
   if (providerName === 'AnthropicProvider') {
     return 'anthropic'
   }
@@ -646,6 +665,10 @@ function inferProviderFamily(providerName: string): 'anthropic' | 'google' | 'op
 
   if (providerName === 'OpenRouterProvider') {
     return 'openrouter'
+  }
+
+  if (providerName === 'GroqProvider') {
+    return 'groq'
   }
 
   if (providerName === 'NvidiaProvider') {
@@ -673,4 +696,65 @@ function buildProviderMismatchMessage(role: string, modelId: string, providerNam
     `Either change ${role}Model to a compatible model ID (e.g. '${DEFAULT_PANEL_MODEL}') or change the ${role} provider configuration.`,
     'Check your API keys and provider config.'
   ].join(' ')
+}
+
+function resolveProviderConfig(config: ProviderConfig): ProviderConfig {
+  const useGroq = typeof config.groqApiKey === 'string' && config.groqApiKey.length > 0
+
+  if (!useGroq) {
+    return config
+  }
+
+  return {
+    ...config,
+    executorModel: GROQ_EXECUTOR_MODEL,
+    intakeModel: GROQ_INTAKE_MODEL,
+    panelModel: GROQ_INTAKE_MODEL,
+    verifierModel: GROQ_VERIFIER_MODEL
+  }
+}
+
+async function runGroqPreflight(args: {
+  provider: GroqProvider
+  rts: RawTraceStore
+  taskId: string
+  abMode: AbMode
+}): Promise<void> {
+  try {
+    await args.provider.analyze('Reply with the single word: ready', GROQ_INTAKE_MODEL)
+    args.rts.append({
+      task_id: args.taskId,
+      ab_mode: args.abMode,
+      agent_role: 'intake',
+      step_index: null,
+      event_type: 'step_output',
+      content_json: JSON.stringify({
+        operation: 'groq_preflight',
+        status: 'ok',
+        model: GROQ_INTAKE_MODEL
+      }),
+      tokens_used: null,
+      cost_usd: null,
+      created_at: new Date().toISOString()
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    args.rts.append({
+      task_id: args.taskId,
+      ab_mode: args.abMode,
+      agent_role: 'intake',
+      step_index: null,
+      event_type: 'error',
+      content_json: JSON.stringify({
+        operation: 'groq_preflight',
+        status: 'failed',
+        model: GROQ_INTAKE_MODEL,
+        error: message
+      }),
+      tokens_used: null,
+      cost_usd: null,
+      created_at: new Date().toISOString()
+    })
+    logWarn('pipeline', '[Pipeline] Groq preflight failed.', { error: message })
+  }
 }

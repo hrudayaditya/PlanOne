@@ -9,6 +9,9 @@ export const DEFAULT_PANEL_MODEL = 'gemini-3.1-flash-lite-preview'
 export const DEFAULT_VERIFIER_MODEL = 'gemini-3.1-flash-lite-preview'
 export const DEFAULT_INTAKE_MODEL = 'gemini-2.5-flash'
 export const DEFAULT_COMPRESSION_MODEL = 'gemini-3-flash-preview'
+export const DEFAULT_GROQ_EXECUTOR_MODEL = 'llama-3.3-70b-versatile'
+export const DEFAULT_GROQ_INTAKE_MODEL = 'llama-3.1-8b-instant'
+export const DEFAULT_GROQ_VERIFIER_MODEL = 'llama-3.1-8b-instant'
 
 /**
  * Ordered model preferences used by the intake pipeline for JSON generation.

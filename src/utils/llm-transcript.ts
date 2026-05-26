@@ -12,7 +12,7 @@ export interface LlmTranscriptContext {
 
 export interface LlmTranscriptEntry {
   timestamp: string
-  provider: 'openrouter' | 'gemini' | 'anthropic' | 'nvidia'
+  provider: 'openrouter' | 'gemini' | 'anthropic' | 'nvidia' | 'groq'
   operation: string
   model: string
   context?: LlmTranscriptContext

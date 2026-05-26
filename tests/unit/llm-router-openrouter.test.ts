@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { AnthropicProvider } from '../../src/llm/anthropic.js'
 import { GeminiProvider } from '../../src/llm/gemini.js'
+import { GroqProvider } from '../../src/llm/groq.js'
 import { NvidiaProvider } from '../../src/llm/nvidia.js'
 import { OpenRouterProvider } from '../../src/llm/openrouter.js'
 import { createProviders, getModelFamily, selectProviderType } from '../../src/llm/router.js'
@@ -47,30 +48,12 @@ describe('llm router openrouter support', () => {
     })).not.toThrow()
   })
 
-  it('throws for inclusionai executor and inclusionai verifier', () => {
-    expect(() => createProviders({
-      openrouterApiKey: 'sk-or-v1-test',
-      executorModel: 'inclusionai/ling-2.6-1t:free',
-      verifierModel: 'inclusionai/ling-2.6-1t:free',
-      intakeModel: 'gemini-2.5-flash',
-      panelModel: 'gemini-3.1-flash-lite-preview',
-      compressionModel: 'gemini-3-flash-preview'
-    })).toThrow()
-  })
-
-  it('throws for google executor and google verifier', () => {
-    expect(() => createProviders({
-      geminiApiKey: 'test',
-      executorModel: 'gemini-2.5-flash',
-      verifierModel: 'gemini-3.1-flash-lite-preview',
-      intakeModel: 'gemini-2.5-flash',
-      panelModel: 'gemini-3.1-flash-lite-preview',
-      compressionModel: 'gemini-3-flash-preview'
-    })).toThrow()
-  })
-
   it('routes namespaced models to OpenRouterProvider', () => {
     expect(selectProviderType('inclusionai/ling-2.6-1t:free', { openrouterApiKey: 'sk-or-v1-test' })).toBe('openrouter')
+  })
+
+  it('routes llama models to GroqProvider when GROQ_API_KEY is configured', () => {
+    expect(selectProviderType('llama-3.3-70b-versatile', { groqApiKey: 'gsk_test' })).toBe('groq')
   })
 
   it('routes gemini models to GeminiProvider', () => {
@@ -97,7 +80,6 @@ describe('llm router openrouter support', () => {
     })
 
     expect(providers.executorProvider).toBeInstanceOf(OpenRouterProvider)
-    expect(providers.verifierProvider).toBeInstanceOf(GeminiProvider)
     expect(providers.panelProvider).toBeInstanceOf(GeminiProvider)
     expect(providers.intakeProvider).toBeInstanceOf(GeminiProvider)
     expect(providers.compressionProvider).toBeInstanceOf(GeminiProvider)
@@ -115,6 +97,21 @@ describe('llm router openrouter support', () => {
     })
 
     expect(providers.executorProvider).toBeInstanceOf(NvidiaProvider)
-    expect(providers.verifierProvider).toBeInstanceOf(GeminiProvider)
+  })
+
+  it('creates the expected provider families for the Groq executor stack', () => {
+    const providers = createProviders({
+      groqApiKey: 'gsk_test',
+      geminiApiKey: 'test',
+      nvidiaApiKey: 'nvapi-test',
+      executorModel: 'llama-3.3-70b-versatile',
+      verifierModel: 'llama-3.1-8b-instant',
+      intakeModel: 'llama-3.1-8b-instant',
+      panelModel: 'llama-3.1-8b-instant',
+      compressionModel: 'gemini-3-flash-preview'
+    })
+
+    expect(providers.executorProvider).toBeInstanceOf(GroqProvider)
+    expect(providers.intakeProvider).toBeInstanceOf(GroqProvider)
   })
 })

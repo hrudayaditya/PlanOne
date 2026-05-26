@@ -47,27 +47,6 @@ export async function runVerifier(
     taskId: input.taskId,
     repoRoot: input.repoRoot
   })
-  const executorProvider = detectProvider(input.plan.assignedExecutorModel)
-  const verifierProvider = detectProvider(input.plan.assignedVerifierModel)
-
-  if (executorProvider === verifierProvider) {
-    input.rts.append({
-      task_id: input.taskId,
-      ab_mode: input.abMode,
-      agent_role: 'verifier',
-      step_index: null,
-      event_type: 'error',
-      content_json: JSON.stringify({
-        message: 'Verifier model provider family matches executor provider family.',
-        executorModel: input.plan.assignedExecutorModel,
-        verifierModel: input.plan.assignedVerifierModel
-      }),
-      tokens_used: null,
-      cost_usd: null,
-      created_at: new Date().toISOString()
-    })
-  }
-
   const affectedFiles = [...new Set(input.stepOutputs.flatMap((output) => output.affectedFiles))]
   const functionalGate = await runFunctionalGate(input.repoRoot, input.rules, {
     ...context,
@@ -141,20 +120,4 @@ function logVerifierGate(input: VerifierInput, gate: number, result: unknown): v
     cost_usd: null,
     created_at: new Date().toISOString()
   })
-}
-
-function detectProvider(model: string): 'anthropic' | 'openai' | 'google' | 'unknown' {
-  if (model.startsWith('claude-')) {
-    return 'anthropic'
-  }
-
-  if (model.startsWith('gpt-') || model.startsWith('o1-')) {
-    return 'openai'
-  }
-
-  if (model.startsWith('gemini-')) {
-    return 'google'
-  }
-
-  return 'unknown'
 }

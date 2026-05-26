@@ -18,6 +18,7 @@ import {
   DEFAULT_VERIFIER_MODEL
 } from './llm/models.js'
 import type { ProviderConfig } from './llm/router.js'
+import { loadEnvFiles } from './utils/env.js'
 import { logError } from './utils/logger.js'
 
 /**
@@ -54,6 +55,7 @@ export function parseArgs(argv: string[]): Record<string, string | boolean> {
  * Main Week 6 CLI entrypoint.
  */
 async function main(): Promise<void> {
+  loadEnvFiles()
   const [, , command = 'run', ...rest] = process.argv
   const args = parseArgs(rest)
 
@@ -130,6 +132,7 @@ async function handleRun(args: Record<string, string | boolean>): Promise<void> 
       providerConfig: {
         anthropicApiKey: typeof args['anthropic-key'] === 'string' ? args['anthropic-key'] : process.env.ANTHROPIC_API_KEY,
         geminiApiKey: typeof args['gemini-key'] === 'string' ? args['gemini-key'] : process.env.GEMINI_API_KEY,
+        groqApiKey: process.env.GROQ_API_KEY,
         nvidiaApiKey: typeof args['nvidia-key'] === 'string' ? args['nvidia-key'] : process.env.NVIDIA_API_KEY,
         openrouterApiKey: typeof args['openrouter-key'] === 'string' ? args['openrouter-key'] : process.env.OPENROUTER_API_KEY,
         openrouterPath: typeof args['openrouter-path'] === 'string' && args['openrouter-path'] === 'paid' ? 'paid' : 'free',
@@ -243,6 +246,7 @@ async function handleEval(args: Record<string, string | boolean>): Promise<void>
   const providerConfig: ProviderConfig = {
     anthropicApiKey: typeof args['anthropic-key'] === 'string' ? args['anthropic-key'] : process.env.ANTHROPIC_API_KEY,
     geminiApiKey: typeof args['gemini-key'] === 'string' ? args['gemini-key'] : process.env.GEMINI_API_KEY,
+    groqApiKey: process.env.GROQ_API_KEY,
     nvidiaApiKey: typeof args['nvidia-key'] === 'string' ? args['nvidia-key'] : process.env.NVIDIA_API_KEY,
     openrouterApiKey: typeof args['openrouter-key'] === 'string' ? args['openrouter-key'] : process.env.OPENROUTER_API_KEY,
     openrouterPath: typeof args['openrouter-path'] === 'string' && args['openrouter-path'] === 'paid' ? 'paid' : 'free',
